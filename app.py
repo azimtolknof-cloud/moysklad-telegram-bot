@@ -446,3 +446,12 @@ threading.Thread(target=reminder_worker, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    @app.get("/debug/telegram")
+def debug_telegram():
+    # Token Render env’dan olinayotganini tekshiradi
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is empty"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    r = requests.get(url, timeout=20)
+    return {"status_code": r.status_code, "body": r.json()}
