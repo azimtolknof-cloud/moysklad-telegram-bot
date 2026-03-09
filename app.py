@@ -7,26 +7,28 @@ import threading
 from datetime import datetime, timedelta
 
 import requests
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 
 app = Flask(__name__)
 
 # =========================
 # ENV
 # =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPERATOR_CHAT_ID = str(os.getenv("OPERATOR_CHAT_ID", "5086400903"))  # operator chat_id
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPERATOR_CHAT_ID = str(os.getenv("OPERATOR_CHAT_ID", "5086400903")).strip()
 
 # MoySklad: TOKEN bilan ishlaymiz
-MOYSKLAD_TOKEN = os.getenv("MOYSKLAD_TOKEN", "")  # <<<<<< MUHIM
-MOYSKLAD_WEBHOOK_SECRET = os.getenv("MOYSKLAD_WEBHOOK_SECRET", "")  # xohlasangiz
+MOYSKLAD_TOKEN = os.getenv("MOYSKLAD_TOKEN", "").strip()
 
-BASE_URL = os.getenv("BASE_URL", "")  # https://xxxx.onrender.com (ixtiyoriy)
-DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
+# Webhook signature tekshirish (ixtiyoriy)
+MOYSKLAD_WEBHOOK_SECRET = os.getenv("MOYSKLAD_WEBHOOK_SECRET", "").strip()
+
+BASE_URL = os.getenv("BASE_URL", "").strip()  # masalan: https://moysklad-telegram-bot.onrender.com
+DB_PATH = os.getenv("DB_PATH", "data.sqlite3").strip()
 
 MS_API_BASE = "https://online.moysklad.ru/api/remap/1.2"
-MS_DEMAND_ENDPOINT = "/entity/demand"     # Отгрузка
-MS_CASHIN_ENDPOINT = "/entity/cashin"     # Приходный ордер (tekshirib moslaymiz)
+MS_DEMAND_ENDPOINT = "/entity/demand"   # Отгрузка
+MS_CASHIN_ENDPOINT = "/entity/cashin"   # Приходный ордер (sizda boshqacha bo‘lishi mumkin)
 
 # =========================
 # DB
@@ -88,12 +90,18 @@ init_db()
 # Telegram helpers
 # =========================
 def tg_api(method: str, payload: dict):
+    """
+    Telegram API wrapper.
+    Xato bo‘lsa, exception tashlaydi (loglarda ko‘rinadi).
+    """
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN env yo‘q")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN env yo‘q yoki bo‘sh")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     r = requests.post(url, json=payload, timeout=25)
-    r.raise_for_status()
+    # Telegram xato bo‘lsa ham JSON qaytaradi, lekin status_code ham 4xx bo‘lishi mumkin
+    if r.status_code >= 400:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
     return r.json()
 
 def tg_send(chat_id: str, text: str, reply_markup=None):
@@ -106,11 +114,15 @@ def tg_answer_callback(callback_id: str, text: str):
     return tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
 # =========================
-# MoySklad helpers (TOKEN AUTH)
+# MoySklad helpers (TOKEN)
 # =========================
 def ms_headers():
+    """
+    MoySklad API token.
+    Odatda Authorization: Bearer <token> ishlaydi.
+    """
     if not MOYSKLAD_TOKEN:
-        raise RuntimeError("MOYSKLAD_TOKEN env yo‘q")
+        raise RuntimeError("MOYSKLAD_TOKEN env yo‘q yoki bo‘sh")
 
     return {
         "Authorization": f"Bearer {MOYSKLAD_TOKEN}",
@@ -118,27 +130,28 @@ def ms_headers():
         "Accept": "application/json",
     }
 
-def ms_get(path: str):
-    full = MS_API_BASE + path
+def ms_get(url: str):
+    full = MS_API_BASE + url
     r = requests.get(full, headers=ms_headers(), timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"MoySklad GET {r.status_code}: {r.text}")
     return r.json()
 
-def ms_put(path: str, data: dict):
-    full = MS_API_BASE + path
+def ms_put(url: str, data: dict):
+    full = MS_API_BASE + url
     r = requests.put(full, json=data, headers=ms_headers(), timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"MoySklad PUT {r.status_code}: {r.text}")
     return r.json()
 
 def verify_ms_signature(raw_body: bytes, header_sig: str) -> bool:
     """
-    MoySklad webhook signature (agar ishlatsangiz).
+    Ixtiyoriy tekshiruv: MOYSKLAD_WEBHOOK_SECRET bo‘lsa tekshiradi.
     """
     if not MOYSKLAD_WEBHOOK_SECRET:
         return True
-
     mac = hmac.new(MOYSKLAD_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, header_sig or "")
+    return hmac.compare_digest(mac, header_sig)
 
 def amount_to_text(amount_minor: int, currency: str):
     v = amount_minor / 100.0
@@ -207,10 +220,22 @@ def calc_debt(counterparty_id: str):
 # =========================
 # Routes
 # =========================
-@app.get("/")
-def index():
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/debug")
+def debug():
+    """
+    Brauzerdan ochib tekshirish uchun.
+    """
     return {
         "ok": True,
+        "env": {
+            "has_telegram_token": bool(TELEGRAM_BOT_TOKEN),
+            "has_moysklad_token": bool(MOYSKLAD_TOKEN),
+            "operator_chat_id": OPERATOR_CHAT_ID,
+        },
         "endpoints": {
             "health": "/health",
             "telegram_webhook": "/telegram (POST)",
@@ -218,121 +243,128 @@ def index():
         }
     }
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+@app.get("/debug/telegram")
+def debug_telegram():
+    """
+    Telegram token ishlayaptimi tekshiradi.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN env yo‘q"}), 500
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    r = requests.get(url, timeout=20)
+    return jsonify({"http_status": r.status_code, "body": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text})
 
 @app.post("/telegram")
 def telegram_webhook():
+    """
+    Telegram webhook faqat POST bo‘ladi.
+    """
     upd = request.json or {}
 
-    # 1) callback buttons
-    if "callback_query" in upd:
-        cq = upd["callback_query"]
-        data = cq.get("data", "")
-        cb_id = cq["id"]
-        from_chat_id = str(cq["from"]["id"])
-
-        try:
-            action, pid_s = data.split(":")
-            pid = int(pid_s)
-        except Exception:
-            tg_answer_callback(cb_id, "Noto‘g‘ri tugma")
-            return {"ok": True}
-
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM pending WHERE id = ?", (pid,))
-        p = cur.fetchone()
-        conn.close()
-
-        if not p:
-            tg_answer_callback(cb_id, "Topilmadi")
-            return {"ok": True}
-
-        if p["status"] != "pending":
-            tg_answer_callback(cb_id, "Bu allaqachon yakunlangan")
-            return {"ok": True}
-
-        if action == "approve":
-            mark_pending(pid, "approved")
-            write_ledger(p["kind"], p["ms_id"], p["counterparty_id"], p["amount_minor"], p["currency"])
+    try:
+        # callback buttons
+        if "callback_query" in upd:
+            cq = upd["callback_query"]
+            data = cq.get("data", "")
+            cb_id = cq["id"]
+            from_chat_id = str(cq["from"]["id"])
 
             try:
-                if p["ms_entity"] == "demand":
-                    ms_put(f"{MS_DEMAND_ENDPOINT}/{p['ms_id']}", {"applicable": True})
-                elif p["ms_entity"] == "cashin":
-                    ms_put(f"{MS_CASHIN_ENDPOINT}/{p['ms_id']}", {"applicable": True})
-            except Exception as e:
-                tg_send(OPERATOR_CHAT_ID, f"⚠️ MoySklad update xato. ms_id={p['ms_id']}\n{e}")
+                action, pid_s = data.split(":")
+                pid = int(pid_s)
+            except Exception:
+                tg_answer_callback(cb_id, "Noto‘g‘ri tugma")
+                return {"ok": True}
 
-            sums = calc_debt(p["counterparty_id"])
-            lines = [f"- {amount_to_text(minor, curcy)}" for curcy, minor in sums.items()]
-            debt_text = "\n".join(lines) if lines else "0"
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM pending WHERE id = ?", (pid,))
+            p = cur.fetchone()
+            conn.close()
 
-            tg_answer_callback(cb_id, "Tasdiqlandi ✅")
-            tg_send(from_chat_id, f"✅ Tasdiqlandi.\nHozirgi qarzingiz:\n{debt_text}")
-            tg_send(OPERATOR_CHAT_ID, f"✅ Mijoz tasdiqladi: {p['kind']} / ms_id={p['ms_id']}")
-        else:
-            mark_pending(pid, "rejected")
-            tg_answer_callback(cb_id, "Rad etildi ❌")
-            tg_send(from_chat_id, "❌ Rad etildi. Operator siz bilan bog‘lanadi.")
-            tg_send(OPERATOR_CHAT_ID, f"❌ Mijoz rad etdi: {p['kind']} / ms_id={p['ms_id']}")
+            if not p:
+                tg_answer_callback(cb_id, "Topilmadi")
+                return {"ok": True}
 
-        return {"ok": True}
+            if p["status"] != "pending":
+                tg_answer_callback(cb_id, "Bu allaqachon yakunlangan")
+                return {"ok": True}
 
-    # 2) normal message
-    msg = upd.get("message")
-    if not msg:
-        return {"ok": True}
+            if action == "approve":
+                mark_pending(pid, "approved")
+                write_ledger(p["kind"], p["ms_id"], p["counterparty_id"], p["amount_minor"], p["currency"])
 
-    chat_id = str(msg["chat"]["id"])
-    text = (msg.get("text") or "").strip()
+                # MoySklad’da hujjatni o‘tkazish
+                try:
+                    if p["ms_entity"] == "demand":
+                        ms_put(f"{MS_DEMAND_ENDPOINT}/{p['ms_id']}", {"applicable": True})
+                    elif p["ms_entity"] == "cashin":
+                        ms_put(f"{MS_CASHIN_ENDPOINT}/{p['ms_id']}", {"applicable": True})
+                except Exception as e:
+                    tg_send(OPERATOR_CHAT_ID, f"⚠️ MoySklad update xato. ms_id={p['ms_id']}\n{e}")
 
-    # /start yoki /start@botname
-    if text.startswith("/start"):
-        kb = {
-            "keyboard": [[{"text": "📲 Telefon raqamni yuborish", "request_contact": True}]],
-            "resize_keyboard": True,
-            "one_time_keyboard": True
-        }
-        tg_send(chat_id, "Assalomu alaykum! Telefon raqamingizni yuboring (verifikatsiya uchun).", kb)
-        return {"ok": True}
+                sums = calc_debt(p["counterparty_id"])
+                lines = [f"- {amount_to_text(minor, curcy)}" for curcy, minor in sums.items()]
+                debt_text = "\n".join(lines) if lines else "0"
 
-    if "contact" in msg:
-        phone = msg["contact"].get("phone_number", "")
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO clients (tg_chat_id, phone, counterparty_id, created_at)
-            VALUES (?, ?, NULL, ?)
-            ON CONFLICT(tg_chat_id) DO UPDATE SET phone=excluded.phone
-        """, (chat_id, phone, datetime.utcnow().isoformat()))
-        conn.commit()
-        conn.close()
+                tg_answer_callback(cb_id, "Tasdiqlandi ✅")
+                tg_send(from_chat_id, f"✅ Tasdiqlandi.\nHozirgi qarzingiz:\n{debt_text}")
+                tg_send(OPERATOR_CHAT_ID, f"✅ Mijoz tasdiqladi: {p['kind']} / ms_id={p['ms_id']}")
+            else:
+                mark_pending(pid, "rejected")
+                tg_answer_callback(cb_id, "Rad etildi ❌")
+                tg_send(from_chat_id, "❌ Rad etildi. Operator siz bilan bog‘lanadi.")
+                tg_send(OPERATOR_CHAT_ID, f"❌ Mijoz rad etdi: {p['kind']} / ms_id={p['ms_id']}")
 
-        tg_send(chat_id, f"✅ Telefon qabul qilindi: {phone}\nOperator sizni MoySklad’dagi kontragent bilan bog‘laydi.")
-        tg_send(OPERATOR_CHAT_ID, f"📲 Telefon verifikatsiya: chat_id={chat_id}, phone={phone}")
-        return {"ok": True}
-
-    if text.lower() in ["qarzim", "debt", "/debt", "/balance", "/balance@isellgen_bot"]:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM clients WHERE tg_chat_id = ?", (chat_id,))
-        c = cur.fetchone()
-        conn.close()
-        if not c or not c["counterparty_id"]:
-            tg_send(chat_id, "Hali MoySklad kontragentga bog‘lanmagansiz. Operatorga yozing.")
             return {"ok": True}
 
-        sums = calc_debt(c["counterparty_id"])
-        lines = [f"- {amount_to_text(minor, curcy)}" for curcy, minor in sums.items()]
-        debt_text = "\n".join(lines) if lines else "0"
-        tg_send(chat_id, f"📌 Hozirgi qarzingiz:\n{debt_text}")
+        # normal messages
+        msg = upd.get("message")
+        if not msg:
+            return {"ok": True}
+
+        chat_id = str(msg["chat"]["id"])
+        text = (msg.get("text") or "").strip()
+
+        if text == "/start":
+            kb = {
+                "keyboard": [[{"text": "📲 Telefon raqamni yuborish", "request_contact": True}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": True
+            }
+            tg_send(chat_id, "Assalomu alaykum! Telefon raqamingizni yuboring (verifikatsiya uchun).", kb)
+            return {"ok": True}
+
+        if "contact" in msg:
+            phone = msg["contact"].get("phone_number", "")
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO clients (tg_chat_id, phone, counterparty_id, created_at)
+                VALUES (?, ?, NULL, ?)
+                ON CONFLICT(tg_chat_id) DO UPDATE SET phone=excluded.phone
+            """, (chat_id, phone, datetime.utcnow().isoformat()))
+            conn.commit()
+            conn.close()
+
+            tg_send(chat_id, f"✅ Telefon qabul qilindi: {phone}\nOperator sizni MoySklad’dagi kontragent bilan bog‘laydi.")
+            tg_send(OPERATOR_CHAT_ID, f"📲 Yangi telefon verifikatsiya: chat_id={chat_id}, phone={phone}")
+            return {"ok": True}
+
+        if text.lower() in ["qarzim", "debt", "/debt", "/balance", "/history", "/help"]:
+            # hozircha minimal javob (MVP)
+            tg_send(chat_id, "Hozir MVP: /start orqali telefon yuboring. Keyin kontragentga bog‘laymiz.")
+            return {"ok": True}
+
+        tg_send(chat_id, "Buyruqlar: /start")
         return {"ok": True}
 
-    tg_send(chat_id, "Buyruqlar: /start, /balance (qarzim)")
-    return {"ok": True}
+    except Exception as e:
+        # Telegram webhook 500 ko‘rsa "pending_update_count" ortib boradi.
+        # Shuning uchun xatoni yutib, 200 qaytaramiz, lekin logga chiqaramiz.
+        print("Telegram webhook error:", e)
+        return {"ok": True}
 
 @app.post("/moysklad/webhook")
 def moysklad_webhook():
@@ -355,24 +387,23 @@ def moysklad_webhook():
 
         try:
             path = href.split("/api/remap/1.2")[-1]
-        except Exception:
-            continue
-
-        try:
             doc = ms_get(path)
-        except Exception:
+        except Exception as e:
+            print("MoySklad fetch error:", e)
             continue
 
         agent = doc.get("agent") or {}
-        cp_meta = (agent.get("meta") or {})
-        cp_href = cp_meta.get("href", "")
+        cp_href = (agent.get("meta") or {}).get("href", "")
         counterparty_id = cp_href.rstrip("/").split("/")[-1] if cp_href else None
         if not counterparty_id:
             continue
 
         client = find_client_by_counterparty(counterparty_id)
         if not client:
-            tg_send(OPERATOR_CHAT_ID, f"⚠️ Kontragent Telegramga bog‘lanmagan. counterparty_id={counterparty_id}")
+            try:
+                tg_send(OPERATOR_CHAT_ID, f"⚠️ Kontragent Telegramga bog‘lanmagan. counterparty_id={counterparty_id}")
+            except Exception:
+                pass
             continue
 
         tg_chat_id = client["tg_chat_id"]
@@ -407,6 +438,7 @@ def moysklad_webhook():
                 {"text": "❌ Yo‘q, rad etaman", "callback_data": f"reject:{pid}"}
             ]]
         }
+
         try:
             res = tg_send(tg_chat_id, text, markup)
             msg_id = str(res["result"]["message_id"])
@@ -416,12 +448,16 @@ def moysklad_webhook():
             conn.commit()
             conn.close()
         except Exception as e:
-            tg_send(OPERATOR_CHAT_ID, f"⚠️ Telegramga yuborilmadi. pending_id={pid}\n{e}")
+            print("Telegram send error:", e)
+            try:
+                tg_send(OPERATOR_CHAT_ID, f"⚠️ Telegramga yuborilmadi. pending_id={pid}\n{e}")
+            except Exception:
+                pass
 
     return {"ok": True}
 
 # =========================
-# Reminder loop
+# Reminder loop (4 soat o‘tsa operatorga)
 # =========================
 def reminder_worker():
     while True:
@@ -434,24 +470,18 @@ def reminder_worker():
             for r in rows:
                 created = datetime.fromisoformat(r["created_at"])
                 if now - created >= timedelta(hours=4):
-                    tg_send(OPERATOR_CHAT_ID, f"⏰ 4 soat bo‘ldi, mijoz tasdiqlamadi. pending_id={r['id']} ms_id={r['ms_id']}")
+                    try:
+                        tg_send(OPERATOR_CHAT_ID, f"⏰ 4 soat bo‘ldi, mijoz tasdiqlamadi. pending_id={r['id']} ms_id={r['ms_id']}")
+                    except Exception:
+                        pass
                     cur.execute("UPDATE pending SET reminded=1 WHERE id=?", (r["id"],))
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print("Reminder error:", e)
         time.sleep(300)
 
 threading.Thread(target=reminder_worker, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-    @app.get("/debug/telegram")
-def debug_telegram():
-    # Token Render env’dan olinayotganini tekshiradi
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is empty"}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
-    r = requests.get(url, timeout=20)
-    return {"status_code": r.status_code, "body": r.json()}
