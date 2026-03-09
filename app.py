@@ -1,13 +1,11 @@
 import os
 import re
-import json
 import time
 import hmac
 import hashlib
 import sqlite3
 import threading
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
 
 import requests
 from flask import Flask, request, abort
@@ -17,23 +15,24 @@ app = Flask(__name__)
 # =========================
 # ENV (Render'da qo'yiladi)
 # =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
 OPERATOR_CHAT_ID = str(os.getenv("OPERATOR_CHAT_ID", "5086400903")).strip()
 
 # MoySklad API TOKEN (login/parol EMAS)
-MOYSKLAD_TOKEN = os.getenv("MOYSKLAD_TOKEN", "").strip()
+MOYSKLAD_TOKEN = (os.getenv("MOYSKLAD_TOKEN", "") or "").strip()
 
 # Webhook signature (ixtiyoriy)
-MOYSKLAD_WEBHOOK_SECRET = os.getenv("MOYSKLAD_WEBHOOK_SECRET", "").strip()
+MOYSKLAD_WEBHOOK_SECRET = (os.getenv("MOYSKLAD_WEBHOOK_SECRET", "") or "").strip()
 
-# Render URL (ixtiyoriy, lekin debug uchun qulay)
-BASE_URL = os.getenv("BASE_URL", "").strip()
+# Render URL (ixtiyoriy)
+BASE_URL = (os.getenv("BASE_URL", "") or "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "data.sqlite3").strip()
+DB_PATH = (os.getenv("DB_PATH", "data.sqlite3") or "").strip()
 
-# MoySklad base URL: ba'zi akkauntlarda online.moysklad.ru 410 qaytarishi mumkin.
-MS_API_BASE_PRIMARY = os.getenv("MS_API_BASE", "https://online.moysklad.ru/api/remap/1.2").strip()
-MS_API_BASE_FALLBACK = "https://api.moysklad.ru/api/remap/1.2"
+# MoySklad base URL
+# Sizning test JSON'laringiz api.moysklad.ru dan kelgan — shuni primary qilamiz.
+MS_API_BASE_PRIMARY = (os.getenv("MS_API_BASE", "https://api.moysklad.ru/api/remap/1.2") or "").strip()
+MS_API_BASE_FALLBACK = "https://online.moysklad.ru/api/remap/1.2"
 
 MS_DEMAND_ENDPOINT = "/entity/demand"   # Отгрузка
 MS_CASHIN_ENDPOINT = "/entity/cashin"   # Приходный ордер
@@ -64,13 +63,13 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT,                    -- shipment | payment
-        ms_entity TEXT,               -- demand | cashin
+        kind TEXT,
+        ms_entity TEXT,
         ms_id TEXT,
         counterparty_id TEXT,
         amount_minor INTEGER,
         currency TEXT,
-        status TEXT,                  -- pending | approved | rejected | expired
+        status TEXT,
         created_at TEXT,
         reminded INTEGER DEFAULT 0,
         tg_chat_id TEXT,
@@ -81,7 +80,7 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT,                    -- shipment | payment
+        kind TEXT,
         ms_id TEXT,
         counterparty_id TEXT,
         amount_minor INTEGER,
@@ -123,39 +122,56 @@ def tg_answer_callback(callback_id: str, text: str):
 # =========================
 # MoySklad helpers (TOKEN)
 # =========================
-def ms_headers():
-    if not MOYSKLAD_TOKEN:
+def _clean_token(t: str) -> str:
+    t = (t or "").strip()
+    # "Bearer xxx" bo'lib qolsa
+    if t.lower().startswith("bearer "):
+        t = t.split(" ", 1)[1].strip()
+    # "xxx" yoki 'xxx' bo'lib qolsa
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+    return t
+
+def ms_headers(method: str):
+    token = _clean_token(MOYSKLAD_TOKEN)
+    if not token:
         raise RuntimeError("MOYSKLAD_TOKEN env yo‘q (Render env ga qo‘ying)")
-    return {
-        "Authorization": f"Bearer {MOYSKLAD_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
+
+    h = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
     }
+    # GET da Content-Type qo'ymaymiz (400 oldini oladi)
+    if method.upper() in ("POST", "PUT", "PATCH"):
+        h["Content-Type"] = "application/json"
+    return h
 
 def ms_request(method: str, path: str, json_body=None, params=None):
     """
-    1) Primary base bilan urinadi
-    2) Agar 410 bo‘lsa fallback base (api.moysklad.ru) bilan qayta urinadi
+    1) Primary base bilan urinadi (api.moysklad.ru)
+    2) Agar 410 bo‘lsa fallback (online.moysklad.ru) bilan qayta urinadi
     """
     def _do(base):
         url = base + path
-        r = requests.request(
+        return requests.request(
             method=method,
             url=url,
-            headers=ms_headers(),
+            headers=ms_headers(method),
             params=params,
             json=json_body,
             timeout=35
         )
-        return r
 
     r1 = _do(MS_API_BASE_PRIMARY)
     if r1.status_code == 410:
         r2 = _do(MS_API_BASE_FALLBACK)
-        r2.raise_for_status()
+        if not r2.ok:
+            raise RuntimeError(f"MoySklad HTTP {r2.status_code}: {r2.text}")
         return r2.json()
 
-    r1.raise_for_status()
+    if not r1.ok:
+        raise RuntimeError(f"MoySklad HTTP {r1.status_code}: {r1.text}")
+
     return r1.json()
 
 def ms_get(path: str, params=None):
@@ -165,12 +181,8 @@ def ms_put(path: str, data: dict):
     return ms_request("PUT", path, json_body=data)
 
 def verify_ms_signature(raw_body: bytes, header_sig: str) -> bool:
-    """
-    MoySklad webhook signature (ixtiyoriy).
-    """
     if not MOYSKLAD_WEBHOOK_SECRET:
         return True
-
     mac = hmac.new(MOYSKLAD_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(mac, header_sig)
 
@@ -178,66 +190,52 @@ def verify_ms_signature(raw_body: bytes, header_sig: str) -> bool:
 # Phone normalize + variants
 # =========================
 def normalize_phone(phone_raw: str) -> str:
-    """
-    Qoidalar:
-    - hamma narsa raqamga o‘tkaziladi (space, +, - olib tashlanadi)
-    - agar 9 xonali bo‘lsa => 998 + 9
-    - agar 12 xonali va 998 bilan boshlansa => o‘sha
-    - agar 11 xonali va 8 bilan boshlansa (ba'zan 8XXXXXXXXXXX) => oxirgi 12 ni olishga urinish
-    """
     d = re.sub(r"\D+", "", phone_raw or "")
     if not d:
         return ""
 
-    # Masalan: 772656050 => 998772656050
     if len(d) == 9:
         return "998" + d
 
-    # Masalan: 998772656050
     if len(d) == 12 and d.startswith("998"):
         return d
 
-    # Ba’zi holatlar: 8772656050 yoki boshqa
-    # Agar 12 dan uzun bo‘lsa, oxirgi 12 ni olamiz (ko‘pincha +998... bo‘ladi)
     if len(d) > 12:
         tail = d[-12:]
         if tail.startswith("998"):
             return tail
 
-    # Agar 10/11 bo‘lsa, oxirgi 9 ni 998 bilan yopishtirib ko‘ramiz
     if len(d) in (10, 11):
         return "998" + d[-9:]
 
     return d
 
 def phone_variants(phone_norm_12: str):
-    """
-    phone_norm_12: 998XXXXXXXXX (12 digits)
-    """
     if not phone_norm_12 or len(phone_norm_12) < 12:
         return []
 
-    p9 = phone_norm_12[-9:]      # 772656050
-    cc = phone_norm_12[:3]       # 998
-    op = phone_norm_12[3:5]      # 77
-    rest = phone_norm_12[5:]     # 2656050
+    p9 = phone_norm_12[-9:]
+    cc = phone_norm_12[:3]
+    op = phone_norm_12[3:5]
+    rest = phone_norm_12[5:]  # 7 ta raqam
 
-    # 77 265 60 50 ko‘rinishini yasaymiz:
-    pretty = f"{op} {rest[0:3]} {rest[3:5]} {rest[5:7]}"
+    pretty = f"{op} {rest[0:3]} {rest[3:5]} {rest[5:7]}"  # 77 265 60 50
 
     variants = [
-        phone_norm_12,                 # 998772656050
-        f"+{phone_norm_12}",           # +998772656050
-        f"{cc} {pretty}",              # 998 77 265 60 50
-        f"+{cc} {pretty}",             # +998 77 265 60 50
-        p9,                            # 772656050
-        pretty,                        # 77 265 60 50
+        phone_norm_12,            # 998772656050
+        f"+{phone_norm_12}",      # +998772656050
+        f"{cc}{op}{rest}",        # 998772656050 (yana)
+        f"{cc} {pretty}",         # 998 77 265 60 50
+        f"+{cc} {pretty}",        # +998 77 265 60 50
+        p9,                       # 772656050
+        pretty,                   # 77 265 60 50
+        f"{op}{rest}",            # 772656050 (yana)
+        f"{op} {rest[0:3]} {rest[3:5]} {rest[5:7]}",  # 77 265 60 50 (yana)
     ]
 
-    # Unique
     out, seen = [], set()
     for v in variants:
-        vv = v.strip()
+        vv = (v or "").strip()
         if vv and vv not in seen:
             out.append(vv)
             seen.add(vv)
@@ -246,6 +244,9 @@ def phone_variants(phone_norm_12: str):
 def amount_to_text(amount_minor: int, currency: str):
     v = amount_minor / 100.0
     return f"{v:,.2f} {currency}".replace(",", " ")
+
+def norm_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
 
 # =========================
 # Business logic
@@ -272,9 +273,7 @@ def save_client_phone(tg_chat_id: str, phone_raw: str, phone_norm: str):
 def bind_client_to_counterparty(tg_chat_id: str, counterparty_id: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE clients SET counterparty_id=? WHERE tg_chat_id=?
-    """, (counterparty_id, tg_chat_id))
+    cur.execute("UPDATE clients SET counterparty_id=? WHERE tg_chat_id=?", (counterparty_id, tg_chat_id))
     conn.commit()
     conn.close()
 
@@ -284,7 +283,8 @@ def create_pending(kind, ms_entity, ms_id, counterparty_id, amount_minor, curren
     cur.execute("""
         INSERT INTO pending (kind, ms_entity, ms_id, counterparty_id, amount_minor, currency, status, created_at, tg_chat_id)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-    """, (kind, ms_entity, ms_id, counterparty_id, int(amount_minor), currency, datetime.utcnow().isoformat(), str(tg_chat_id)))
+    """, (kind, ms_entity, ms_id, counterparty_id, int(amount_minor), currency,
+          datetime.utcnow().isoformat(), str(tg_chat_id)))
     pid = cur.lastrowid
     conn.commit()
     conn.close()
@@ -293,7 +293,7 @@ def create_pending(kind, ms_entity, ms_id, counterparty_id, amount_minor, curren
 def mark_pending(pid: int, status: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("UPDATE pending SET status = ? WHERE id = ?", (status, pid))
+    cur.execute("UPDATE pending SET status=? WHERE id=?", (status, pid))
     conn.commit()
     conn.close()
 
@@ -310,7 +310,7 @@ def write_ledger(kind, ms_id, counterparty_id, amount_minor, currency):
 def calc_debt(counterparty_id: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT kind, amount_minor, currency FROM ledger WHERE counterparty_id = ?", (counterparty_id,))
+    cur.execute("SELECT kind, amount_minor, currency FROM ledger WHERE counterparty_id=?", (counterparty_id,))
     rows = cur.fetchall()
     conn.close()
 
@@ -324,14 +324,7 @@ def calc_debt(counterparty_id: str):
             sums[curcy] -= int(r["amount_minor"])
     return sums
 
-def norm_digits(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
-
 def ms_find_counterparty_by_phone(phone_norm_12: str):
-    """
-    1) bir nechta variant bilan search qilamiz
-    2) kelgan rows ichidan phone/externalCode bo‘yicha mosini ajratamiz
-    """
     variants = phone_variants(phone_norm_12)
     if not variants:
         return {"ok": True, "found": False, "rows": [], "variants": []}
@@ -340,19 +333,11 @@ def ms_find_counterparty_by_phone(phone_norm_12: str):
     want9 = phone_norm_12[-9:]
 
     candidates = []
-
-    # har bir variant bilan qidiramiz (rate-limitga ehtiyot: limit=100)
     for q in variants:
-        try:
-            data = ms_get("/entity/counterparty", params={"search": q, "limit": 100})
-        except requests.HTTPError as e:
-            # operatorga aniq xatoni yuboramiz
-            raise RuntimeError(f"{e}") from e
-
+        data = ms_get("/entity/counterparty", params={"search": q, "limit": 100})
         for row in data.get("rows", []) or []:
             candidates.append(row)
 
-    # unique by id
     uniq = {}
     for r in candidates:
         rid = r.get("id")
@@ -360,24 +345,20 @@ def ms_find_counterparty_by_phone(phone_norm_12: str):
             uniq[rid] = r
     rows = list(uniq.values())
 
-    # qat’iy tekshiruv: phone ichidan raqamlarni olib, oxiri want9 bilan tugasa mos deb olamiz
     matched = []
     for r in rows:
         phone_field = r.get("phone", "") or ""
         external_code = r.get("externalCode", "") or ""
         d_phone = norm_digits(phone_field)
+        d_ext = norm_digits(external_code)
 
         if d_phone.endswith(want9) or d_phone == want12:
             matched.append(r)
             continue
-
-        # ba'zi kompaniyalarda telefon externalCode ga yozib qo‘yilgan bo‘lishi mumkin
-        d_ext = norm_digits(external_code)
         if d_ext.endswith(want9) or d_ext == want12:
             matched.append(r)
             continue
 
-    # agar bitta aniq match bo‘lsa qaytaramiz
     if len(matched) == 1:
         return {"ok": True, "found": True, "row": matched[0], "variants": variants, "candidates": rows}
 
@@ -393,6 +374,7 @@ def index():
         "endpoints": {
             "health": "/health",
             "debug": "/debug",
+            "ms_test": "/ms_test?phone=998772526060",
             "telegram_webhook": "/telegram (POST)",
             "moysklad_webhook": "/moysklad/webhook (POST)"
         }
@@ -404,14 +386,25 @@ def health():
 
 @app.get("/debug")
 def debug():
-    # env bor-yo‘qligini tekshirish (tokenlarni ko‘rsatmaydi)
     return {
         "ok": True,
         "has_telegram_token": bool(TELEGRAM_BOT_TOKEN),
-        "has_moysklad_token": bool(MOYSKLAD_TOKEN),
+        "has_moysklad_token": bool(_clean_token(MOYSKLAD_TOKEN)),
         "ms_base_primary": MS_API_BASE_PRIMARY,
         "ms_base_fallback": MS_API_BASE_FALLBACK
     }
+
+@app.get("/ms_test")
+def ms_test():
+    phone = request.args.get("phone", "")
+    phone_norm = normalize_phone(phone)
+    variants = phone_variants(phone_norm)
+    try:
+        data = ms_get("/entity/counterparty", params={"search": phone_norm, "limit": 100})
+        rows = data.get("rows", []) or []
+        return {"ok": True, "phone": phone, "phone_norm": phone_norm, "variants": variants, "rows_count": len(rows), "first": (rows[0] if rows else None)}
+    except Exception as e:
+        return {"ok": False, "phone": phone, "phone_norm": phone_norm, "variants": variants, "error": str(e)}
 
 # =========================
 # Telegram webhook
@@ -452,7 +445,6 @@ def telegram_webhook():
             mark_pending(pid, "approved")
             write_ledger(p["kind"], p["ms_id"], p["counterparty_id"], p["amount_minor"], p["currency"])
 
-            # MoySklad’da hujjatni applicable=true
             try:
                 if p["ms_entity"] == "demand":
                     ms_put(f"{MS_DEMAND_ENDPOINT}/{p['ms_id']}", {"applicable": True})
@@ -485,7 +477,6 @@ def telegram_webhook():
 
     # operator komandalar
     if text.startswith("/bind") and chat_id == OPERATOR_CHAT_ID:
-        # format: /bind <tg_chat_id> <counterparty_id>
         parts = text.split()
         if len(parts) != 3:
             tg_send(chat_id, "Format: /bind <tg_chat_id> <counterparty_id>")
@@ -517,7 +508,6 @@ def telegram_webhook():
 
         save_client_phone(chat_id, phone_raw, phone_norm)
 
-        # MoySklad’dan topib bog‘lashga urinamiz
         try:
             res = ms_find_counterparty_by_phone(phone_norm)
         except Exception as e:
@@ -529,20 +519,17 @@ def telegram_webhook():
             row = res["row"]
             cp_id = row["id"]
             bind_client_to_counterparty(chat_id, cp_id)
-
             name = row.get("name", "Kontragent")
             tg_send(chat_id, f"✅ Telefon qabul qilindi: {phone_norm}\n✅ MoySklad kontragent topildi va bog‘landi: {name}")
             tg_send(OPERATOR_CHAT_ID, f"✅ Telefon verifikatsiya (TOPILDI): chat_id={chat_id}, phone={phone_norm}, counterparty_id={cp_id}, name={name}")
             return {"ok": True}
 
-        # topilmasa yoki ko‘p match bo‘lsa
         matched = res.get("rows") or []
         variants = res.get("variants") or []
 
         tg_send(chat_id, f"✅ Telefon qabul qilindi: {phone_norm}\n⚠️ MoySklad’da bu telefon bilan kontragent TOPILMADI (yoki bir nechta chiqdi). Operator bog‘laydi.")
         info = f"📲 Telefon verifikatsiya (TOPILMADI):\nchat_id={chat_id}\nphone_norm={phone_norm}\nvariants={variants}\nmatched_count={len(matched)}"
 
-        # agar bir nechta mos kelgan bo‘lsa operatorga ro‘yxat
         if matched:
             lines = []
             for r in matched[:10]:
@@ -686,6 +673,5 @@ def reminder_worker():
 threading.Thread(target=reminder_worker, daemon=True).start()
 
 if __name__ == "__main__":
-    # Render portni o‘zi beradi
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
